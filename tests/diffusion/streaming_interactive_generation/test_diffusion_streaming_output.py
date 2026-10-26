@@ -11,6 +11,7 @@ Covers:
 import asyncio
 import contextlib
 import queue
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -453,6 +454,8 @@ class TestPipelineStreamingOutputToEntrypoint:
     @staticmethod
     def _make_async_omni(engine: _OrchestratorBridgeEngine) -> AsyncOmni:
         omni = object.__new__(AsyncOmni)
+        omni._shutdown_condition = threading.Condition()
+        omni._shutting_down = False
         omni.engine = engine
         omni.log_stats = False
         omni.collect_stage_metrics = True

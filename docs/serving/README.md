@@ -41,6 +41,29 @@ Use `http://localhost:8091/v1` as the `base_url` for an OpenAI SDK client. If
 the server was started with `--api-key`, include an `Authorization` header with
 `Bearer <api-key>` in requests.
 
+## Graceful Shutdown
+
+Set `--shutdown-timeout` to a positive number of seconds to let active
+`AsyncOmni.generate()` requests finish on SIGTERM or SIGINT, for example
+`vllm serve <model> --omni --shutdown-timeout 300`. Shutdown rejects new
+engine requests and keeps output dispatch alive until existing generators
+finish or the timeout expires. Remaining generators receive an engine shutdown
+error; the default `0` retains immediate shutdown. Uvicorn then finishes HTTP
+response handling. This does not add a drain contract for duplex sessions or
+persistence for asynchronous background jobs.
+
+Shutdown wakes requests waiting for generation to resume, and expired drains
+cancel streaming input pumps so requests waiting for their first input chunk
+can finish with a shutdown error. Repeated shutdown calls preserve the first
+call's drain budget. This budget bounds generation draining, not HTTP response
+transmission or engine cleanup.
+
+Direct callers with active requests must run the synchronous shutdown off the
+request event loop, for example `await asyncio.to_thread(engine.shutdown, timeout=300)`.
+For Kubernetes, `terminationGracePeriodSeconds` must cover `preStop`, the
+request-drain timeout, and engine cleanup; increasing it does not configure
+`--shutdown-timeout` automatically.
+
 ## Choose a Core HTTP Endpoint
 
 Prefer a task-specific endpoint when one matches your workload. Use Chat

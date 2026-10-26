@@ -138,6 +138,18 @@ codec may not import the engine, the entrypoints or the model code, which
 second consumer lands (#6592 P0b) the package is expected to graduate to its
 own module document with owners drawn from both consumers.
 
+## Async request shutdown
+
+`AsyncOmni.shutdown(timeout)` stops generation admission and, for a positive
+budget, waits for `request_states` to empty before stopping output dispatch and
+the engine. Request cleanup notifies the shutdown waiter. The synchronous wait
+must run off the request event loop. Zero or expired budgets fail remaining
+request queues before cancelling output dispatch; HTTP response teardown remains
+owned by the server. Duplex session draining is outside this contract.
+Closing admission wakes paused generation calls; aborting remaining requests
+also cancels their input pumps. A repeated shutdown call does not interrupt an
+existing drain or start a second teardown.
+
 ## Candidate invariants
 
 These identifiers are proposals while the document is `draft`.

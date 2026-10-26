@@ -3,6 +3,7 @@
 
 import asyncio
 import re
+import threading
 from types import SimpleNamespace
 
 import anyio
@@ -18,6 +19,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints import async_omni as async_omni_mod
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
@@ -67,6 +69,8 @@ async def fake_process_results(request_id, metrics, final_stage_id_for_e2e, req_
 
 def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) -> AsyncOmni:
     omni = object.__new__(AsyncOmni)
+    omni._shutdown_condition = threading.Condition()
+    omni._shutting_down = False
     omni._pause_cond = asyncio.Condition()
     omni._paused = False
     omni.engine = SimpleNamespace(
@@ -952,7 +956,7 @@ def test_shutdown_fails_pending_requests():
     output pump is the only writer to the per-request queues and it stops
     during teardown, so without this a request blocked on its queue would hang
     the graceful HTTP shutdown (#8912)."""
-    omni = object.__new__(AsyncOmni)
+    omni = get_async_omni_instance()
     omni._loop = None
     omni.final_output_task = None
     omni.request_states = {}
@@ -960,7 +964,7 @@ def test_shutdown_fails_pending_requests():
     omni.engine = SimpleNamespace(shutdown=lambda *a, **k: shutdown_calls.append(1))
 
     for rid in ("req-1", "req-2"):
-        omni.request_states[rid] = SimpleNamespace(request_id=rid, queue=asyncio.Queue())
+        omni.request_states[rid] = ClientRequestState(request_id=rid, queue=asyncio.Queue())
 
     omni.shutdown()
 
@@ -985,9 +989,9 @@ def test_shutdown_fails_pending_requests_from_foreign_thread():
     import threading
 
     async def run():
-        omni = object.__new__(AsyncOmni)
+        omni = get_async_omni_instance()
         omni._loop = asyncio.get_running_loop()
-        omni.request_states = {"req-1": SimpleNamespace(request_id="req-1", queue=asyncio.Queue())}
+        omni.request_states = {"req-1": ClientRequestState(request_id="req-1", queue=asyncio.Queue())}
         omni.engine = SimpleNamespace(shutdown=lambda *a, **k: None)
         # A live output pump that shutdown() must cancel.
         pump = asyncio.create_task(asyncio.Event().wait())

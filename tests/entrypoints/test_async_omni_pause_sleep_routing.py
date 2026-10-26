@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
@@ -21,6 +22,8 @@ pytestmark = [pytest.mark.core_model]
 
 def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni = object.__new__(AsyncOmni)
+    omni._shutdown_condition = threading.Condition()
+    omni._shutting_down = False
     omni._pause_cond = asyncio.Condition()
     omni._paused = False
     omni._admitting = 0

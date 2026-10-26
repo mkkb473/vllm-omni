@@ -11,6 +11,7 @@ StageEngineCoreClient instances) instead of OmniStage with worker processes.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
@@ -34,6 +35,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import ErrorMessage
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S, AsyncOmniBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
@@ -90,6 +92,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
         AsyncOmniBase.__init__(self, *args, model=model, **kwargs)
         self.tts_max_instructions_length = tts_max_instructions_length
+        self._shutdown_condition = threading.Condition()
+        self._shutting_down = False
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
         # In-flight EngineCore submits (non-streaming add_request, or each
@@ -112,6 +116,50 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         self._level2_sleeping: bool = False
         # Paced interaction ingress is stamped before ordered worker delivery.
         self._interaction_reservations: dict[tuple[str, str], float | None] = {}
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        """Stop admission and wait up to ``timeout`` seconds for active generators.
+
+        With active requests, call positive-timeout shutdown off the event loop
+        (as the vLLM launcher does) so generation can continue during the wait.
+        None and zero retain immediate shutdown. Repeated calls leave the first
+        shutdown in control of its drain budget.
+        """
+        with self._shutdown_condition:
+            if self._shutting_down:
+                return
+            if timeout is not None and timeout > 0 and self.request_states:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+                else:
+                    raise RuntimeError("Use await asyncio.to_thread(engine.shutdown, timeout=...) to drain requests")
+            self._shutting_down = True
+            if self._paused and self._loop is not None and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._wake_paused_requests(), self._loop)
+            if timeout is not None and timeout > 0:
+                if not self._shutdown_condition.wait_for(lambda: not self.request_states, timeout=timeout):
+                    logger.warning(
+                        "[AsyncOmni] Shutdown timeout expired with %d active requests", len(self.request_states)
+                    )
+        # Hand teardown to the inherited failure propagation only after the
+        # drain. Stop asyncio tasks on their owner loop; engine cleanup stays
+        # on the launcher's executor thread.
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            for state in list(self.request_states.values()):
+                if state.input_stream_task is not None:
+                    loop.call_soon_threadsafe(state.input_stream_task.cancel)
+            task = self.final_output_task
+            if task is not None:
+                loop.call_soon_threadsafe(task.cancel)
+                self.final_output_task = None
+        super().shutdown()
+
+    async def _wake_paused_requests(self) -> None:
+        async with self._pause_cond:
+            self._pause_cond.notify_all()
 
     # ==================== Generate Method ====================
 
@@ -185,9 +233,14 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # Streaming generate does **not** hold the slot while waiting for the
         # first client chunk; the input pump acquires it immediately before each
         # EngineCore ADD/update.
+        if self._shutting_down:
+            raise OmniEngineDeadError("Engine is shutting down")
+        self._loop = asyncio.get_running_loop()
         streaming_input = isinstance(prompt, AsyncGenerator)
         async with self._pause_cond:
-            await self._pause_cond.wait_for(lambda: not self._paused)
+            await self._pause_cond.wait_for(lambda: not self._paused or self._shutting_down)
+            if self._shutting_down:
+                raise OmniEngineDeadError("Engine is shutting down")
             if not streaming_input:
                 self._admitting = getattr(self, "_admitting", 0) + 1
         admitting = not streaming_input
@@ -212,9 +265,6 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     "Diffusion stages accept only a single prompt per request. "
                     "Submit multiple independent requests to use scheduler batching."
                 )
-
-            # Start final output dispatcher on the first call to generate()
-            self._final_output_handler()
 
             # Forward bare sampling_params (e.g. from /v1/completions) as the stage-0 entry.
             if sampling_params_list is None and sampling_params is not None:
@@ -264,7 +314,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             )
             req_state.metrics = metrics
             req_state.request_arrival_ts = wall_start_ts
-            self.request_states[request_id] = req_state
+            with self._shutdown_condition:
+                if self._shutting_down:
+                    raise OmniEngineDeadError("Engine is shutting down")
+                self.request_states[request_id] = req_state
+                self._final_output_handler()
 
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
@@ -363,7 +417,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             reservations = getattr(self, "_interaction_reservations", {})
             for key in [key for key in reservations if key[0] == request_id]:
                 reservations.pop(key, None)
-            self._log_summary_and_cleanup(request_id)
+            with self._shutdown_condition:
+                self._log_summary_and_cleanup(request_id)
+                self._shutdown_condition.notify_all()
 
     async def _release_generate_admission(self) -> None:
         """Drop one in-flight generate admission slot held across add_request."""

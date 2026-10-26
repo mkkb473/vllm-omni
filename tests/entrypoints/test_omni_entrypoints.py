@@ -6,12 +6,14 @@ from __future__ import annotations
 import asyncio
 import gc
 import queue
+import threading
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -208,6 +210,262 @@ def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) 
         "vllm_omni.entrypoints.async_omni.AsyncOmni._get_unique_request_id",
         staticmethod(lambda request_id: request_id),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_count", [1, 2])
+async def test_async_shutdown_drains_consumed_generators(monkeypatch: pytest.MonkeyPatch, request_count: int):
+    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    generators = [app.generate("hello", request_id=f"req-{i}") for i in range(request_count)]
+    outputs = [asyncio.ensure_future(anext(generator)) for generator in generators]
+    shutdown_started = threading.Event()
+    original_wait = app._shutdown_condition.wait
+
+    def wait(timeout: float | None = None) -> bool:
+        shutdown_started.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(app._shutdown_condition, "wait", wait)
+    shutdown = None
+    try:
+        async with asyncio.timeout(5):
+            while len(engine.submitted) < request_count:
+                await asyncio.sleep(0)
+        shutdown = asyncio.create_task(asyncio.to_thread(app.shutdown, timeout=5))
+        assert await asyncio.to_thread(shutdown_started.wait, 5)
+        assert not engine.shutdown_called
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await anext(app.generate("late", request_id="late"))
+        assert len(engine.submitted) == request_count
+
+        for i, (generator, output) in enumerate(zip(generators, outputs)):
+            engine.output_q.put(make_output_msg(f"req-{i}", 0, payload="final", output_finished=True))
+            assert (await asyncio.wait_for(output, 5)).finished
+            # Wait for the caller to consume the final yield and run cleanup,
+            # rather than just delivering engine output into the queue.
+            assert not shutdown.done()
+            with pytest.raises(StopAsyncIteration):
+                await anext(generator)
+        await asyncio.wait_for(shutdown, 5)
+        assert engine.shutdown_called
+        assert not app.request_states
+    finally:
+        for output in outputs:
+            output.cancel()
+        await asyncio.gather(*outputs, return_exceptions=True)
+        for generator in generators:
+            await generator.aclose()
+        app.shutdown()
+        if shutdown is not None:
+            await asyncio.wait_for(shutdown, 5)
+
+
+@pytest.mark.asyncio
+async def test_async_shutdown_timeout_wakes_remaining_requests(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    generator = app.generate("hello", request_id="req-1")
+    output = asyncio.ensure_future(anext(generator))
+    try:
+        async with asyncio.timeout(5):
+            while not engine.submitted:
+                await asyncio.sleep(0)
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown, timeout=0.01), 5)
+        assert engine.shutdown_called
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(output, 5)
+        assert not app.request_states
+    finally:
+        output.cancel()
+        await asyncio.gather(output, return_exceptions=True)
+        await generator.aclose()
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_async_shutdown_does_not_block_request_event_loop(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    generator = app.generate("hello", request_id="req-1")
+    output = asyncio.ensure_future(anext(generator))
+    try:
+        async with asyncio.timeout(5):
+            while not engine.submitted:
+                await asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="asyncio.to_thread"):
+            app.shutdown(timeout=5)
+        assert not engine.shutdown_called
+        assert not app._shutting_down
+    finally:
+        output.cancel()
+        await asyncio.gather(output, return_exceptions=True)
+        await generator.aclose()
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_async_shutdown_returns_without_waiting_when_idle(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    app.shutdown(timeout=300)
+    assert engine.shutdown_called
+    app._paused = True
+    with pytest.raises(OmniEngineDeadError, match="shutting down"):
+        await asyncio.wait_for(anext(app.generate("late", request_id="late")), 5)
+
+
+@pytest.mark.asyncio
+async def test_async_shutdown_cancelled_request_releases_waiter(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    generator = app.generate("hello", request_id="req-1")
+    output = asyncio.ensure_future(anext(generator))
+    try:
+        async with asyncio.timeout(5):
+            while not engine.submitted:
+                await asyncio.sleep(0)
+        shutdown = asyncio.create_task(asyncio.to_thread(app.shutdown, timeout=5))
+        async with asyncio.timeout(5):
+            while not app._shutting_down:
+                await asyncio.sleep(0)
+        assert not engine.shutdown_called
+        output.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await output
+        await asyncio.wait_for(shutdown, 5)
+        assert not app.request_states
+        assert engine.shutdown_called
+    finally:
+        output.cancel()
+        await asyncio.gather(output, return_exceptions=True)
+        await generator.aclose()
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_async_shutdown_drain_stops_output_task_on_its_event_loop(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    app._final_output_handler()
+    task = app.final_output_task
+    assert task is not None
+    loop = asyncio.get_running_loop()
+    debug = loop.get_debug()
+    try:
+        loop.set_debug(True)  # Detect Task.cancel() called from the launcher executor.
+        await asyncio.sleep(0)
+        await asyncio.to_thread(app.shutdown, timeout=1)
+        await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()
+        assert engine.shutdown_called
+    finally:
+        loop.set_debug(debug)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [0, 0.01])
+async def test_async_shutdown_wakes_paused_admission(monkeypatch: pytest.MonkeyPatch, timeout: float):
+    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    app._paused = True
+    generator = app.generate("hello", request_id="paused")
+    output = asyncio.ensure_future(anext(generator))
+    try:
+        await asyncio.sleep(0)
+        assert not engine.submitted
+        assert not output.done()
+        await asyncio.to_thread(app.shutdown, timeout=timeout)
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(output, 1)
+        assert not engine.submitted
+    finally:
+        output.cancel()
+        await asyncio.gather(output, return_exceptions=True)
+        await generator.aclose()
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [0, 0.01])
+async def test_async_shutdown_wakes_streaming_input_before_first_chunk(monkeypatch: pytest.MonkeyPatch, timeout: float):
+    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+
+    async def inputs():
+        await asyncio.Event().wait()
+        yield StreamingInput(prompt={"prompt_token_ids": [1]})
+
+    generator = app.generate(
+        inputs(), request_id="stream", sampling_params_list=[SamplingParams(output_kind=RequestOutputKind.DELTA)]
+    )
+    output = asyncio.ensure_future(anext(generator))
+    input_task = None
+    try:
+        async with asyncio.timeout(5):
+            while not app.request_states or app.request_states["stream"].input_stream_task is None:
+                await asyncio.sleep(0)
+        input_task = app.request_states["stream"].input_stream_task
+        assert not engine.submitted
+        await asyncio.to_thread(app.shutdown, timeout=timeout)
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(output, 1)
+        assert input_task is not None and input_task.done()
+        assert not app.request_states
+        assert not engine.submitted
+    finally:
+        output.cancel()
+        await asyncio.gather(output, return_exceptions=True)
+        await generator.aclose()
+        app.shutdown()
+        if input_task is not None:
+            await asyncio.gather(input_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("from_loop", [False, True])
+async def test_async_shutdown_repeated_call_preserves_first_drain(monkeypatch: pytest.MonkeyPatch, from_loop: bool):
+    engine = FakeAsyncOmniEngine(stage_metadata=DIFFUSION_ONLY_META)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+    generator = app.generate("hello", request_id="req-1")
+    output = asyncio.ensure_future(anext(generator))
+    shutdown = None
+    try:
+        async with asyncio.timeout(5):
+            while not engine.submitted:
+                await asyncio.sleep(0)
+        shutdown = asyncio.create_task(asyncio.to_thread(app.shutdown, timeout=5))
+        async with asyncio.timeout(5):
+            while not app._shutting_down:
+                await asyncio.sleep(0)
+        if from_loop:
+            app.shutdown()
+        else:
+            await asyncio.to_thread(app.shutdown)
+        assert not engine.shutdown_called
+        engine.output_q.put(make_output_msg("req-1", 0, payload="final", output_finished=True))
+        assert (await asyncio.wait_for(output, 1)).finished
+        with pytest.raises(StopAsyncIteration):
+            await anext(generator)
+        await asyncio.wait_for(shutdown, 1)
+        assert engine.shutdown_called
+    finally:
+        output.cancel()
+        await asyncio.gather(output, return_exceptions=True)
+        await generator.aclose()
+        if shutdown is not None:
+            await asyncio.wait_for(shutdown, 5)
+        app.shutdown()
 
 
 def _make_base():
