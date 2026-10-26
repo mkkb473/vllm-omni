@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import threading
 import time
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -719,6 +720,8 @@ class TestPromptUpdateIntegration:
     @staticmethod
     def _make_async_omni(engine: _OrchestratorBridgeEngine) -> AsyncOmni:
         omni = object.__new__(AsyncOmni)
+        omni._shutdown_condition = threading.Condition()
+        omni._shutting_down = False
         omni.engine = engine  # pyright: ignore[reportAttributeAccessIssue]
         omni.log_stats = False
         omni.collect_stage_metrics = True
